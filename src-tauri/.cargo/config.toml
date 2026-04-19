@@ -1,0 +1,2 @@
+[target.x86_64-pc-windows-msvc]
+linker = "E:\\05Environment\\14.VisualStudio\\IDE\\VC\\Tools\\MSVC\\14.20.27508\\bin\\HostX64\\x64\\link.exe"
