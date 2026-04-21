@@ -210,7 +210,7 @@ fn do_set_wallpaper(path: &str) -> Result<String, String> {
 async fn search_wallpapers(keyword: String, atleast: Option<String>, page: Option<u32>) -> Result<Vec<Wallpaper>, String> {
     let page_num = page.unwrap_or(1);
     let mut url = format!(
-        "https://wallhaven.cc/api/v1/search?q={}&purity=100&sorting=random&page={}",
+        "https://wallhaven.cc/api/v1/search?q={}&purity=100&sorting=date_added&page={}",
         urlencoding::encode(&keyword),
         page_num
     );

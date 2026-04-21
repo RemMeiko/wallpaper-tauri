@@ -10,6 +10,7 @@ import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from "@
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { FolderOpen, Play, Square } from "lucide-react";
+import { useDebouncedCallback } from "@/hooks/useDebouncedCallback";
 
 export interface AppSettings {
   download_dir: string;
@@ -37,6 +38,22 @@ export function SettingsTab({ settings, onSettingsChange }: SettingsTabProps) {
   const [toggling, setToggling] = useState(false);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // Local input state for debounced fields (allows immediate UI updates)
+  const [localDownloadDir, setLocalDownloadDir] = useState(settings.download_dir);
+  const [localWallpaperDir, setLocalWallpaperDir] = useState(settings.local_wallpaper_dir);
+  const [localInterval, setLocalInterval] = useState(String(settings.rotation_interval_minutes));
+
+  // Sync local state when settings change from external sources (e.g. folder picker, load)
+  useEffect(() => {
+    setLocalDownloadDir(settings.download_dir);
+  }, [settings.download_dir]);
+  useEffect(() => {
+    setLocalWallpaperDir(settings.local_wallpaper_dir);
+  }, [settings.local_wallpaper_dir]);
+  useEffect(() => {
+    setLocalInterval(String(settings.rotation_interval_minutes));
+  }, [settings.rotation_interval_minutes]);
+
   // Poll rotation status every 5 seconds
   useEffect(() => {
     const poll = async () => {
@@ -54,6 +71,7 @@ export function SettingsTab({ settings, onSettingsChange }: SettingsTabProps) {
     };
   }, []);
 
+  // Immediate save (for folder picker, Select dropdown, rotation toggle)
   const saveSettings = useCallback(
     async (updated: AppSettings) => {
       onSettingsChange(updated);
@@ -67,31 +85,90 @@ export function SettingsTab({ settings, onSettingsChange }: SettingsTabProps) {
     [onSettingsChange]
   );
 
+  // Debounced save for text/number inputs (500ms delay, auto-flush on unmount)
+  const debouncedSave = useDebouncedCallback(
+    async (updated: AppSettings) => {
+      onSettingsChange(updated);
+      try {
+        await invoke("save_settings", { settings: updated });
+        toast.success("设置已保存");
+      } catch (e) {
+        toast.error(String(e));
+      }
+    },
+    500
+  );
+
+  // We need a ref to always have the latest settings for the debounced callback
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
+
+  const handleDownloadDirInput = useCallback(
+    (value: string) => {
+      setLocalDownloadDir(value);
+      // Update parent state immediately for UI consistency, but debounce disk save
+      const updated = { ...settingsRef.current, download_dir: value };
+      onSettingsChange(updated);
+      debouncedSave(updated);
+    },
+    [onSettingsChange, debouncedSave]
+  );
+
+  const handleWallpaperDirInput = useCallback(
+    (value: string) => {
+      setLocalWallpaperDir(value);
+      const updated = { ...settingsRef.current, local_wallpaper_dir: value };
+      onSettingsChange(updated);
+      debouncedSave(updated);
+    },
+    [onSettingsChange, debouncedSave]
+  );
+
+  const handleIntervalInput = useCallback(
+    (value: string) => {
+      setLocalInterval(value);
+      const num = parseInt(value, 10);
+      if (!isNaN(num) && num >= 1 && num <= 1440) {
+        const updated = { ...settingsRef.current, rotation_interval_minutes: num };
+        onSettingsChange(updated);
+        debouncedSave(updated);
+      }
+    },
+    [onSettingsChange, debouncedSave]
+  );
+
   const handleBrowseDownload = useCallback(async () => {
+    debouncedSave.flush(); // flush any pending debounced save before immediate save
     const selected = await open({ directory: true, title: "选择下载目录" });
     if (selected) {
-      saveSettings({ ...settings, download_dir: selected as string });
+      setLocalDownloadDir(selected as string);
+      saveSettings({ ...settingsRef.current, download_dir: selected as string });
     }
-  }, [settings, saveSettings]);
+  }, [saveSettings, debouncedSave]);
 
   const handleBrowseLocal = useCallback(async () => {
+    debouncedSave.flush();
     const selected = await open({ directory: true, title: "选择本地壁纸目录" });
     if (selected) {
-      saveSettings({ ...settings, local_wallpaper_dir: selected as string });
+      setLocalWallpaperDir(selected as string);
+      saveSettings({ ...settingsRef.current, local_wallpaper_dir: selected as string });
     }
-  }, [settings, saveSettings]);
+  }, [saveSettings, debouncedSave]);
 
   const handleToggleRotation = useCallback(async () => {
+    debouncedSave.flush();
     setToggling(true);
     try {
       if (rotationStatus.running) {
         await invoke("stop_rotation");
-        // Also update settings
-        saveSettings({ ...settings, rotation_enabled: false });
+        // Update settings without triggering saveSettings toast (to avoid double toast)
+        const updated = { ...settingsRef.current, rotation_enabled: false };
+        await invoke("save_settings", { settings: updated });
+        onSettingsChange(updated);
         toast.success("自动轮换已停止");
       } else {
         // Save settings first so rotation reads latest config
-        const updated = { ...settings, rotation_enabled: true };
+        const updated = { ...settingsRef.current, rotation_enabled: true };
         await invoke("save_settings", { settings: updated });
         onSettingsChange(updated);
         await invoke("start_rotation");
@@ -105,17 +182,7 @@ export function SettingsTab({ settings, onSettingsChange }: SettingsTabProps) {
     } finally {
       setToggling(false);
     }
-  }, [rotationStatus.running, settings, saveSettings, onSettingsChange]);
-
-  const handleIntervalChange = useCallback(
-    (value: string) => {
-      const num = parseInt(value, 10);
-      if (!isNaN(num) && num >= 1 && num <= 1440) {
-        saveSettings({ ...settings, rotation_interval_minutes: num });
-      }
-    },
-    [settings, saveSettings]
-  );
+  }, [rotationStatus.running, onSettingsChange, debouncedSave]);
 
   const formatNextChange = (iso: string | null) => {
     if (!iso) return "—";
@@ -144,10 +211,8 @@ export function SettingsTab({ settings, onSettingsChange }: SettingsTabProps) {
                 <Input
                   className="flex-1 h-9"
                   placeholder="输入壁纸保存目录路径..."
-                  value={settings.download_dir}
-                  onChange={(e) =>
-                    saveSettings({ ...settings, download_dir: e.target.value })
-                  }
+                  value={localDownloadDir}
+                  onChange={(e) => handleDownloadDirInput(e.target.value)}
                 />
                 <Tooltip>
                   <TooltipTrigger
@@ -169,10 +234,8 @@ export function SettingsTab({ settings, onSettingsChange }: SettingsTabProps) {
                 <Input
                   className="flex-1 h-9"
                   placeholder="输入本地壁纸目录路径..."
-                  value={settings.local_wallpaper_dir}
-                  onChange={(e) =>
-                    saveSettings({ ...settings, local_wallpaper_dir: e.target.value })
-                  }
+                  value={localWallpaperDir}
+                  onChange={(e) => handleWallpaperDirInput(e.target.value)}
                 />
                 <Tooltip>
                   <TooltipTrigger
@@ -238,8 +301,8 @@ export function SettingsTab({ settings, onSettingsChange }: SettingsTabProps) {
                 min={1}
                 max={1440}
                 className="w-32 h-9"
-                value={settings.rotation_interval_minutes}
-                onChange={(e) => handleIntervalChange(e.target.value)}
+                value={localInterval}
+                onChange={(e) => handleIntervalInput(e.target.value)}
               />
               <p className="text-xs text-muted-foreground">范围 1 ~ 1440 分钟（1 天）</p>
             </div>
@@ -249,9 +312,10 @@ export function SettingsTab({ settings, onSettingsChange }: SettingsTabProps) {
               <label className="text-sm text-muted-foreground">轮换模式</label>
               <Select
                 value={settings.rotation_mode}
-                onValueChange={(val) =>
-                  saveSettings({ ...settings, rotation_mode: val as string })
-                }
+                onValueChange={(val) => {
+                  debouncedSave.flush();
+                  saveSettings({ ...settingsRef.current, rotation_mode: val as string });
+                }}
               >
                 <SelectTrigger className="w-40">
                   <SelectValue />
