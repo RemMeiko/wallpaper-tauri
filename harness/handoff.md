@@ -1,41 +1,35 @@
-# 交接: Sprint 3
+# 交接: Sprint 1 — Bug 修复（搜索去重 + 设置防抖 + 本地缩略图 + 双重 toast）
 
 ## 状态: 可以评审
 
 ## 测试说明
 
 1. 启动应用：在项目根目录执行 `npm run tauri dev`
-2. 验证配置持久化：
-   - 切换到"设置" Tab，确认显示两个 Card 分组（目录设置、自动轮换）
-   - 确认下载目录和本地壁纸目录已自动填充系统默认路径
-   - 修改下载目录路径（手动输入或点击文件夹按钮选择），确认出现 toast "设置已保存"
-   - 关闭应用，检查 `~/.wallpaper_app/settings.json` 文件是否存在且内容正确
-   - 重新启动应用，确认设置页显示之前保存的配置值
-3. 验证设置页 UI：
-   - 确认下载目录和本地壁纸目录各有 Input + 文件夹按钮
-   - 确认轮换间隔输入框为数字类型，范围 1-1440
-   - 确认轮换模式下拉框有"随机"和"顺序"两个选项
-   - 修改轮换间隔和模式，确认每次修改后 toast 提示保存成功
-4. 验证壁纸自动轮换：
-   - 在设置页将轮换间隔设为 1 分钟（方便测试）
-   - 确认本地壁纸目录指向一个包含多张图片的目录
-   - 点击"启用自动轮换"按钮，确认按钮变为红色"停止轮换"
-   - 确认状态显示"运行中 · 下次切换: HH:MM:SS"
-   - 等待 1 分钟，确认桌面壁纸自动切换
-   - 点击"停止轮换"，确认状态变为"已停止"，桌面壁纸不再自动切换
-5. 验证搜索页下载目录联动：
-   - 在设置页修改下载目录
-   - 切换到搜索页，确认 DirectoryBar 显示的路径与设置页一致
-   - 在搜索页修改下载目录，切换到设置页确认同步更新
-6. 验证本地壁纸 Tab 自动加载：
-   - 在设置页设置本地壁纸目录为一个包含图片的目录
-   - 切换到"本地壁纸" Tab，确认自动扫描并展示该目录的图片
-7. 验证遗留问题修复：
-   - 搜索壁纸并下载多张，选中 2 张已下载壁纸，确认"设为壁纸"按钮为禁用状态
-   - 仅选中 1 张已下载壁纸，确认"设为壁纸"按钮启用
-   - 在本地壁纸 Tab 选择包含大量图片（50+）的目录，确认最后一张卡片的入场动画延迟不超过 300ms
-   - 搜索壁纸后多次点击"加载更多"，确认结果计数文本正确显示总数
-8. 构建验证：
+2. 验证搜索去重（Bug 1）：
+   - 切换到"搜索壁纸" Tab，输入关键词（如 "nature"）搜索
+   - 点击"加载更多"3 次，检查所有结果中是否有重复壁纸（同一 id 不应出现两次）
+   - 确认结果按日期降序排列，多次加载顺序一致
+3. 验证设置防抖（Bug 2）：
+   - 切换到"设置" Tab
+   - 在下载目录输入框中快速连续输入 10 个字符，观察是否只在停止输入后弹出一次 toast
+   - 在本地壁纸目录输入框中连续输入，同样验证只弹出一次 toast
+   - 在轮换间隔输入框中连续修改数字，同样验证只弹出一次 toast
+   - 通过文件夹按钮选择目录，确认立即保存并弹出 toast（不受防抖影响）
+   - 修改轮换模式下拉框，确认立即保存并弹出 toast
+   - 在输入框中输入内容后立即切换到其他 Tab，再切回设置 Tab 确认值已保存
+4. 验证本地缩略图（Bug 3）：
+   - 切换到"本地壁纸" Tab
+   - 选择一个包含 jpg/png 图片的本地目录，确认所有图片缩略图正常显示
+   - 确认图片加载过程中显示 skeleton 占位，加载完成后平滑过渡
+   - 选择包含 20+ 张图片的目录，确认所有图片都能显示
+   - 选择路径中包含中文字符的目录，确认图片正常显示
+   - 选择路径中包含空格的目录，确认图片正常显示
+   - 选择一个不包含图片的空目录，确认显示空状态提示
+5. 验证停止轮换双重 toast（Bug 4）：
+   - 切换到"设置" Tab，点击"启用自动轮换"
+   - 确认弹出一个 toast "自动轮换已启动"
+   - 点击"停止轮换"，确认只弹出一个 toast "自动轮换已停止"（不是两个）
+6. 构建验证：
    - `npm run build` — 前端构建通过（已验证）
    - `cd src-tauri && cargo build --release` — Rust release 编译通过（已验证）
 
@@ -51,25 +45,18 @@
 
 | 文件 | 变更内容 |
 |------|----------|
-| `src-tauri/Cargo.toml` | 新增 `dirs`、`rand`、`chrono` 依赖 |
-| `src-tauri/src/main.rs` | 新增 `AppSettings`、`RotationStatus`、`AppState` 结构体；新增 `load_settings`、`save_settings`、`start_rotation`、`stop_rotation`、`get_rotation_status` 命令；提取 `scan_dir_for_images` 和 `do_set_wallpaper` 为独立函数供轮换复用；`main()` 中注册 AppState 和所有新命令 |
-| `src/App.tsx` | 新增 `settings` state 和 `useEffect` 启动加载配置；`downloadDir` 改为从 `settings.download_dir` 读取；引入 `SettingsTab` 替换占位内容；`LocalWallpaperTab` 传入 `initialDir` prop；修复 `canSetWallpaper`（useMemo + 单选约束）；修复 `doSetWallpaper`（单选检查）；修复 `doLoadMore`（函数式 setResults 回调内同步更新 resultText） |
-| `src/components/LocalWallpaperTab.tsx` | 新增 `initialDir` prop 和 `useEffect` 自动扫描；动画延迟改为 `Math.min(index * 30, 300)` |
-| `src/components/WallpaperGrid.tsx` | 动画延迟改为 `Math.min(index * 30, 300)` |
+| `src-tauri/tauri.conf.json` | 配置 CSP 策略（允许 `asset:` 协议和 Wallhaven 图片域名）；启用 asset protocol（`enable: true, scope: ["**"]`） |
+| `src-tauri/Cargo.toml` | tauri 依赖添加 `protocol-asset` feature |
+| `src/hooks/useDebouncedCallback.ts` | 泛型约束从 `unknown[]` 改为 `any[]`，修复 TypeScript 类型不兼容错误 |
 
-### 新增的文件
+### 未修改的文件（已有修复，验证通过）
 
-| 文件 | 用途 |
+| 文件 | 说明 |
 |------|------|
-| `src/components/SettingsTab.tsx` | 设置 Tab 完整组件（目录配置 + 轮换配置 + 状态轮询） |
-
-## 关于 Sprint 2 遗留问题 #1 的补充说明
-
-Sprint 2 评审中指出"合同与实际修复方案不一致（目录选择按钮）"。实际情况是：合同计划将 `TooltipTrigger render` 改为 `asChild`，但 base-ui 的 TooltipTrigger 不支持 `asChild`，`render` prop 是其标准用法。实际根因是缺少 Tauri v2 capabilities 权限声明，通过创建 `capabilities/default.json` 解决。方案变更是合理的技术判断，此处补充说明以消除文档与代码的脱节。
+| `src-tauri/src/main.rs` | 第 213 行已使用 `sorting=date_added`（Bug 1 搜索去重） |
+| `src/components/SettingsTab.tsx` | 已使用 `useDebouncedCallback` 防抖（Bug 2）；`handleToggleRotation` 已用直接 invoke（Bug 4） |
+| `src/hooks/useDebouncedCallback.ts` | hook 逻辑已完整（500ms 延迟、flush on unmount） |
 
 ## 已知缺陷
 
-1. **轮换开关使用 Button 而非 Toggle** — base-ui Toggle 是 pressed/unpressed 状态切换组件，不适合做开/关切换。改用 Button（启用/停止两种状态），语义更清晰
-2. **设置页输入框每次 onChange 触发保存** — 手动输入目录路径时每次按键都会保存。实际使用中用户更多通过文件夹按钮选择，性能影响可忽略
-3. **轮换间隔修改后需手动重启** — 修改间隔后需停止再启动轮换才能生效，避免频繁重启定时器
-4. **顺序模式重启后从头开始** — 合同中明确声明"不做断点续传"，符合预期
+1. **Asset protocol scope 使用 `["**"]`（宽泛权限）** — Tauri v2 asset protocol scope 为静态配置，不支持运行时动态添加。由于用户可选择任意目录，使用 `["**"]` 是唯一可行方案。桌面应用本身已有文件系统访问权限，实际安全风险可控。
