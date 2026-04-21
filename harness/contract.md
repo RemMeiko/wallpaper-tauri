@@ -1,196 +1,138 @@
-# Sprint 合同: Sprint 3 — 配置持久化 + 自动轮换
+# Sprint 合同: Sprint 1 — Bug 修复（搜索去重 + 设置防抖 + 本地缩略图 + 双重 toast）
 
 ## 范围
 
-本 Sprint 实现应用的设置页面完整功能，包括：
-1. 配置持久化机制（读写本地 JSON 配置文件）
-2. 设置页 UI（下载目录、本地壁纸目录、轮换参数配置）
-3. 壁纸自动轮换功能（定时器 + 随机/顺序模式）
+本 Sprint 修复第一轮开发遗留的 4 个 Bug：
 
-基于 spec 中 Sprint 3 的定义，将"设置"Tab 从占位状态升级为完整可用的配置中心。
+1. **搜索结果跨页去重** — 修改 `search_wallpapers` 命令的排序方式，从 `sorting=random` 改为稳定排序（如 `sorting=date_added` 或 `sorting=relevance`），避免跨页重复
+2. **设置页 Input 保存防抖优化** — 为 `SettingsTab.tsx` 中的 Input 组件添加防抖逻辑，停止输入后才触发保存，减少频繁的磁盘写入和 toast 弹出
+3. **本地壁纸库缩略图无法显示** — 配置 Tauri v2 的 asset protocol 权限，使 `convertFileSrc` 转换的 `asset://` 协议 URL 能正常加载本地图片
+4. **停止轮换时双重 toast** — 修复停止轮换时同时弹出两个 toast 的问题（修复成本低，顺带修复）
 
 ## 实现计划
 
-### 1. 配置持久化（Rust 后端）
+### 1. 搜索去重
 
-**配置结构**:
-```rust
-struct AppSettings {
-    download_dir: String,           // 下载目录路径
-    local_wallpaper_dir: String,    // 本地壁纸库目录路径
-    rotation_enabled: bool,         // 轮换开关
-    rotation_interval_minutes: u32, // 轮换间隔（分钟）
-    rotation_mode: String,          // 轮换模式："random" | "sequential"
-}
-```
+**技术方案**：修改 `src-tauri/src/main.rs` 中的 `search_wallpapers` 命令，将 Wallhaven API 的 `sorting` 参数从 `random` 改为 `date_added`（按上传日期降序）。
 
-**存储位置**: `~/.wallpaper_app/settings.json`（使用 `dirs` crate 获取用户主目录）
+**理由**：
+- `date_added` 是稳定排序，同一关键词的多次请求返回顺序一致，跨页不会重复
+- 相比 `relevance`（相关度），`date_added` 能保证新壁纸优先展示，用户体验更好
+- 不影响搜索结果的多样性，因为 Wallhaven 的壁纸库本身足够大
 
-**Tauri 命令**:
-- `load_settings() -> Result<AppSettings, String>`: 读取配置，文件不存在时返回默认值
-- `save_settings(settings: AppSettings) -> Result<(), String>`: 保存配置到文件
+**影响范围**：`main.rs` 第 213 行 URL 构造逻辑
 
-**默认值**:
-- `download_dir`: 用户下载目录（`dirs::download_dir()`）
-- `local_wallpaper_dir`: 用户图片目录（`dirs::picture_dir()`）
-- `rotation_enabled`: false
-- `rotation_interval_minutes`: 30
-- `rotation_mode`: "random"
+### 2. 设置防抖
 
-### 2. 设置页 UI（React 前端）
+**技术方案**：在 `SettingsTab.tsx` 中实现防抖逻辑：
 
-创建 `SettingsTab.tsx` 组件，包含以下配置项：
+- 为下载目录、本地壁纸目录、轮换间隔三个 Input 组件的 `onChange` 添加防抖（500ms）
+- 使用 `useRef` 存储防抖 timer，在组件卸载时 flush（立即触发保存）
+- 文件夹选择按钮、轮换模式 Select 下拉框仍然立即保存（不受防抖影响）
 
-**下载目录配置**:
-- Input 显示当前路径 + 文件夹按钮（复用 DirectoryBar 的交互模式）
-- 修改后自动调用 `save_settings`
+**实现细节**：
+- 创建 `useDebouncedCallback` 自定义 hook，封装防抖逻辑
+- 在 `useEffect` cleanup 中调用 flush，确保组件卸载时最后一次输入不丢失
+- 防抖期间不显示 toast，只在实际保存时显示
 
-**本地壁纸目录配置**:
-- Input 显示当前路径 + 文件夹按钮
-- 修改后自动调用 `save_settings`
-- 说明文字："自动轮换将从此目录选取壁纸"
+**影响范围**：`SettingsTab.tsx` 第 148-150、173-175、242 行的 `onChange` 处理
 
-**轮换配置区域**:
-- Toggle 开关："启用自动轮换"
-- 数字输入框："轮换间隔（分钟）"，范围 1-1440（1 天）
-- Select 下拉框："轮换模式"，选项：随机 / 顺序
-- 状态显示：轮换运行中 / 已停止
+### 3. 本地缩略图修复
 
-**布局**:
-- 使用 Card 组件分组（"目录设置"、"自动轮换"）
-- 保持深色主题风格一致
+**技术方案**：配置 Tauri v2 的 asset protocol 权限
 
-### 3. 壁纸自动轮换（Rust 后端）
+**根因分析**：
+- `LocalWallpaperTab.tsx` 使用 `convertFileSrc(path)` 将本地路径转换为 `asset://localhost/{path}` 协议 URL
+- Tauri v2 的 asset protocol 需要在 `capabilities/default.json` 中显式配置权限和 scope
+- 当前 `capabilities/default.json` 只有 `core:default`、`dialog:default`、`fs:default`，缺少 asset protocol 相关权限
 
-**Tauri 命令**:
-- `start_rotation() -> Result<(), String>`: 启动轮换定时器
-- `stop_rotation() -> Result<(), String>`: 停止轮换定时器
-- `get_rotation_status() -> Result<RotationStatus, String>`: 查询轮换状态
+**修复步骤**：
+1. 在 `src-tauri/capabilities/default.json` 的 `permissions` 数组中添加 `"asset:default"`
+2. 配置 asset protocol 的 scope，允许访问用户选择的本地壁纸目录
 
-**RotationStatus 结构**:
-```rust
-struct RotationStatus {
-    running: bool,
-    next_change_at: Option<String>, // ISO 8601 时间戳
-}
-```
+**Scope 配置策略**：
+- 由于用户可以选择任意目录，无法预先配置固定 scope
+- **优先调研 Tauri v2 动态 scope 方案**：查阅 Tauri v2 文档，确认是否支持运行时动态添加 scope（如通过 `asset_protocol_scope().allow_directory()` 在用户选择目录后动态授权）
+- 如果支持动态 scope：实现运行时按需授权，仅允许用户实际选择的目录
+- 如果不支持动态 scope：退而使用 `scope: ["**"]`，并在 handoff.md 中标注为已知安全限制
+- 在 `src-tauri/capabilities/default.json` 中添加 `"asset:default"` 权限
 
-**实现方案**:
-- 使用 `tokio::time::interval` 创建定时器
-- 定时器运行在独立的 tokio task 中
-- 使用 `Arc<Mutex<Option<JoinHandle>>>` 存储 task handle，支持停止
-- 每次触发时：
-  1. 调用 `scan_local_wallpapers` 获取本地壁纸列表
-  2. 根据 `rotation_mode` 选择壁纸（随机用 `rand::thread_rng()`，顺序用全局计数器）
-  3. 调用 `set_wallpaper` 设置壁纸
-  4. 错误时记录日志但不中断定时器
+**影响范围**：
+- `src-tauri/capabilities/default.json`
+- `src-tauri/tauri.conf.json`
 
-**生命周期管理**:
-- 应用启动时，如果 `rotation_enabled` 为 true，自动调用 `start_rotation`
-- 前端切换开关时，调用 `start_rotation` / `stop_rotation`
-- 应用退出时，定时器自动停止（task 随进程结束）
+### 4. 停止轮换双重 toast 修复
 
-### 4. 前端集成
+**技术方案**：修改停止轮换的调用路径，避免同时触发两个 toast。
 
-**App.tsx 修改**:
-- 应用启动时调用 `load_settings`，将配置存入 state
-- 将 `downloadDir` 的初始值改为从配置加载
-- 将配置通过 props 传递给 `SettingsTab`
+**根因分析**：
+- 停止轮换时，前端同时调用了停止命令和状态更新，两个路径各自弹出一个 toast
+- 修复方式：将停止路径改为直接 invoke 调用，移除多余的 toast 触发点，确保停止操作只弹出一个 toast
 
-**LocalWallpaperTab.tsx 修改**:
-- 接收 `localWallpaperDir` prop 作为默认目录
-- 初始化时自动扫描该目录（如果路径非空）
-
-**SettingsTab.tsx**:
-- 接收 `settings` 和 `onSettingsChange` props
-- 任何配置修改后立即调用 `save_settings` 并更新父组件 state
-- 轮换开关变化时调用 `start_rotation` / `stop_rotation`
-- 使用 `useEffect` 定时轮询 `get_rotation_status` 更新状态显示（每 5 秒）
-
-### 5. 遗留问题处理
-
-根据 `evaluation.md` 中的遗留问题，本 Sprint 顺带修复以下低成本问题：
-
-**修复 — 搜索页"设为壁纸"在多选场景下行为不明确（Sprint 2 遗留 #2）**:
-- 修改 `App.tsx` 中 `canSetWallpaper` 计算逻辑：仅当选中数量为 1 且该壁纸已下载时启用按钮
-- 修改 `doSetWallpaper` 逻辑：移除 `find` 查找，直接使用唯一选中的 id
-
-**修复 — LocalWallpaperTab 动画延迟累积（Sprint 2 遗留 #3 + Sprint 1 遗留 #3）**:
-- 修改 `LocalWallpaperTab.tsx` 和 `WallpaperGrid.tsx` 中动画延迟计算：使用 `Math.min(index * 30, 300)` 限制最大延迟为 300ms
-
-**修复 — `canSetWallpaper` 每次渲染创建新数组（Sprint 2 遗留 #4）**:
-- 使用 `useMemo` 缓存 `canSetWallpaper` 计算结果
-
-**修复 — doLoadMore 中 resultText 使用闭包捕获的 results.length（Sprint 1 遗留 #1）**:
-- 修改 `doLoadMore`：使用函数式 `setResults` 回调中同步更新 `resultText`
-
-**不修复 — sorting=random 与分页组合可能导致跨页重复（Sprint 1 遗留 #2）**:
-- 这是 Wallhaven API 的固有行为，修复需要改变搜索逻辑架构，超出本 Sprint 范围
-
-**不修复 — 合同与实际修复方案不一致（Sprint 2 遗留 #1）**:
-- 这是文档问题，不影响功能，在本 Sprint handoff 中补充说明即可
+**影响范围**：轮换相关的前端组件（约 1 行代码变更）
 
 ## 验收标准
 
-### 配置持久化（必须通过）
-1. Rust 后端提供 `load_settings` 和 `save_settings` 命令，配置存储在 `~/.wallpaper_app/settings.json`
-2. 配置文件不存在时返回默认值（下载目录、图片目录、轮换关闭、30 分钟间隔、随机模式）
-3. 应用启动时自动加载配置，前端 state 初始化为配置值
-4. 修改设置后保存成功，重启应用后配置恢复
+### 搜索去重（必须通过）
+1. 用户搜索关键词"nature"后，点击"加载更多"3 次，所有结果中无重复壁纸（同一 id 不出现两次）
+2. 搜索结果按稳定顺序排列（按日期降序），多次加载更多后顺序一致
+3. 修改排序方式后，搜索功能正常工作，返回结果数量与之前相当（24 张/页）
+4. 首次搜索仍能返回多样化的结果（不会因为固定排序导致每次搜索结果完全相同）
 
-### 设置页 UI（必须通过）
-5. "设置" Tab 显示完整配置界面，包含下载目录、本地壁纸目录、轮换开关、轮换间隔、轮换模式
-6. 目录配置使用 Input + 文件夹按钮，点击按钮可选择目录
-7. 轮换开关使用 Toggle 组件，间隔使用数字输入框（1-1440 范围），模式使用 Select 下拉框
-8. 修改任何配置后自动保存，toast 提示保存成功
+### 设置防抖（必须通过）
+5. 用户在下载目录输入框中连续输入 10 个字符，只触发一次保存（停止输入后约 500ms 触发）
+6. 用户在本地壁纸目录输入框中连续输入，同样只在停止输入后触发一次保存
+7. 用户在轮换间隔输入框中连续修改数字，同样只在停止输入后触发一次保存
+8. 防抖期间如果用户切换 Tab 或关闭应用，最后一次输入的值不会丢失（组件卸载时 flush）
+9. 通过文件夹选择按钮选择目录时，仍然立即保存（不受防抖影响）
+10. 轮换模式 Select 下拉选择仍然立即保存（不受防抖影响）
+11. 保存成功后仍显示 toast 提示，但不会出现连续多个 toast 弹出
 
-### 壁纸自动轮换（必须通过）
-9. 开启轮换后，Rust 后端启动定时器，按设定间隔自动切换桌面壁纸
-10. 随机模式下每次切换选择不同壁纸（使用随机数生成器）
-11. 顺序模式下按文件名顺序依次切换
-12. 关闭轮换后定时器停止，不再自动切换
-13. 前端显示轮换运行状态（运行中 / 已停止）
+### 本地缩略图（必须通过）
+12. 用户选择一个包含 jpg/png 图片的本地目录后，所有图片缩略图正常显示
+13. 图片加载过程中显示 skeleton 占位，加载完成后平滑过渡显示
+14. 包含 20+ 张图片的目录，所有图片都能正常显示（不是只有部分能显示）
+15. 路径中包含中文字符的图片也能正常显示
+16. 路径中包含空格的图片也能正常显示
+17. 选择一个不包含任何图片的空目录时，显示空状态提示（如"此目录没有图片"），不是空白页面
+18. 选择一个无读取权限或不存在的目录时，显示友好错误提示，应用不崩溃
 
-### 遗留问题修复（必须通过）
-14. 搜索页"设为壁纸"按钮仅在选中单张已下载壁纸时启用
-15. LocalWallpaperTab 和 WallpaperGrid 动画延迟限制在 300ms 以内
-16. `canSetWallpaper` 使用 `useMemo` 缓存
-17. `doLoadMore` 中 `resultText` 不依赖闭包捕获的 `results.length`
+### 停止轮换双重 toast（必须通过）
+19. 用户点击"停止轮换"按钮后，只弹出一个 toast 提示（不是两个）
 
 ### 构建验证（必须通过）
-18. 前端构建通过（`npm run build` 无错误）
-19. Rust release 编译通过（`cargo build --release` 无错误）
+20. 前端构建通过：`npm run build` 无错误
+21. Rust release 编译通过：`cargo build --release` 无错误
 
 ## 本 Sprint 不做的事
 
-- 轮换历史记录（不记录已切换过的壁纸列表）
-- 轮换时的过渡动画或淡入淡出效果
-- 多显示器独立轮换
-- 轮换时排除特定壁纸的黑名单功能
-- 系统托盘图标或通知
-- 开机自启动配置
-- 配置导入/导出功能
-- 顺序模式的断点续传（重启后从头开始）
-- 轮换失败时的重试机制（失败时跳过，等待下次触发）
-- 修复 sorting=random 跨页重复问题（Wallhaven API 固有行为）
+- 不修复"轮换定时器不感知配置变更"问题（evaluation.md 一般问题 #2）— 需要重构定时器架构，超出本 Sprint 范围
+- 不修复"搜索页 DirectoryBar 修改目录时无 toast 反馈"问题（evaluation.md 一般问题 #4）— 影响较小，留待后续优化
+- 不实现新功能（壁纸收藏、以图搜图）— 这些是 Sprint 2 和 Sprint 3 的范围
+
+## 遗留问题处理说明
+
+根据 `evaluation.md`，第一轮开发遗留 4 个一般问题：
+
+1. **停止轮换时双重 toast** — **本 Sprint 修复**（修复成本低，属于正常使用路径上的 bug，顺带修复）
+2. **轮换定时器不感知配置变更** — 本 Sprint 不修复（需要重构定时器架构，超出范围）
+3. **设置页 Input 每次 onChange 触发保存** — **本 Sprint 修复**（这是合同中的 Bug #2）
+4. **搜索页 DirectoryBar 修改目录时无 toast 反馈** — 本 Sprint 不修复（影响较小，不在合同范围内）
+
+本 Sprint 修复 spec.md 中明确定义的 3 个 Bug，并顺带修复修复成本极低的双重 toast 问题。
 
 ## 技术决策说明
 
-1. **配置文件格式选择 JSON**: 简单易读，Rust 的 `serde_json` 支持完善，无需引入额外序列化依赖
-2. **定时器实现选择 tokio::time::interval**: Tauri 已依赖 tokio，无需额外依赖，且支持异步操作
-3. **轮换状态管理使用 Tauri State + Mutex**: 使用 `tauri::State<AppState>` 管理共享状态，定时器 task handle 存储在 `Arc<Mutex<Option<JoinHandle>>>`
-4. **顺序模式使用全局计数器**: 使用 `AtomicUsize` 存储当前索引，每次切换后递增并取模
-5. **前端轮询状态而非事件推送**: 轮询 5 秒间隔足够满足 UI 更新需求，避免 Tauri 事件系统的额外配置复杂度
-6. **新增 Rust 依赖**: `dirs` (获取系统目录) + `rand` (随机选择壁纸)，均为轻量级 crate
+1. **排序方式选择 date_added**: 相比 `relevance`，`date_added` 更稳定且能保证新壁纸优先，用户体验更好
+2. **防抖延迟 500ms**: 平衡用户输入流畅性和保存频率，500ms 是常见的防抖延迟值
+3. **Asset protocol scope 配置策略**: 优先调研 Tauri v2 动态 scope 方案（运行时按需授权用户选择的目录）。如果 Tauri v2 不支持动态 scope，再退而使用 `["**"]` 并在 handoff 中标注为已知安全限制
+4. **防抖实现使用自定义 hook**: 封装防抖逻辑，避免在组件中重复代码，提高可维护性
 
 ## 依赖和风险
 
-**新增 Rust 依赖**:
-- `dirs`: 获取用户主目录、下载目录、图片目录
-- `rand`: 随机模式下选择壁纸
+**新增依赖**：无（防抖逻辑手写，不引入额外库）
 
-**风险及缓解**:
-1. **定时器生命周期**: task 随 Tauri 进程退出自动终止，无僵尸风险
-2. **本地壁纸目录为空**: 轮换触发时如果目录无图片，记录日志并跳过本次切换，不中断定时器
-3. **配置文件损坏**: JSON 解析失败时回退到默认值并覆盖写入修复
-4. **并发安全**: 使用 Mutex 保护共享状态，避免 start/stop 竞态
+**风险及缓解**：
+1. **Asset protocol scope 安全性**: 优先使用动态 scope 方案缩小权限范围；如果不可行，使用 `["**"]` 并在 handoff 中标注为已知安全限制（桌面应用本身已有文件系统访问权限，实际风险可控）
+2. **防抖 flush 时机**: 组件卸载时必须 flush，否则最后一次输入会丢失。使用 `useEffect` cleanup 确保 flush 执行
+3. **排序方式变更影响搜索结果**: `date_added` 排序可能导致搜索结果与之前不同，但这是修复跨页重复的必要代价，且新壁纸优先展示是合理的产品决策
