@@ -3,3 +3,16 @@ dist/
 target/
 .DS_Store
 *.log
+
+# 敏感文件
+.env
+.env.*
+*.key
+*.pem
+
+# 编辑器/IDE
+.vscode/
+.idea/
+
+# Harness 流程产物（开发过程文件，不进仓库）
+harness/

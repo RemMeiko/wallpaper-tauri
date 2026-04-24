@@ -1,5 +1,6 @@
-import { useState, useCallback, useEffect, useMemo } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import { toast } from "sonner";
 
 import { TitleBar } from "./components/TitleBar";
@@ -24,6 +25,36 @@ const DEFAULT_SETTINGS: AppSettings = {
   rotation_mode: "random",
 };
 
+interface ImageSearchAnalysis {
+  primary_query: string;
+  queries: string[];
+  artist?: string | null;
+  series?: string | null;
+  category_hint?: string | null;
+  confidence: string;
+}
+
+export interface ImageSearchHistory {
+  keyword: string;
+  imagePath: string; // 用户给出的原图路径
+  timestamp: number;
+}
+
+const IMAGE_SEARCH_HISTORY_KEY = "wallpaper_image_search_history";
+
+function loadImageSearchHistory(): ImageSearchHistory[] {
+  try {
+    const raw = localStorage.getItem(IMAGE_SEARCH_HISTORY_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveImageSearchHistory(history: ImageSearchHistory[]) {
+  localStorage.setItem(IMAGE_SEARCH_HISTORY_KEY, JSON.stringify(history.slice(0, 50)));
+}
+
 function App() {
   const [keyword, setKeyword] = useState("");
   const [resolution, setResolution] = useState("");
@@ -34,34 +65,27 @@ function App() {
   const [resultText, setResultText] = useState("");
   const [progressPercent, setProgressPercent] = useState<number | null>(null);
   const [previewWallpaper, setPreviewWallpaper] = useState<Wallpaper | null>(null);
-
-  // 分页状态
+  const [imageSearching, setImageSearching] = useState(false);
   const [currentPage, setCurrentPage] = useState(1);
   const [hasMore, setHasMore] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
-
-  // 已下载文件路径映射 (wallpaper id -> local path)
-  const [downloadedFiles, setDownloadedFiles] = useState<Map<string, string>>(new Map());
-
-  // 配置状态
+  const [, setDownloadedFiles] = useState<Map<string, string>>(new Map());
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
+  const [activeImageQuery, setActiveImageQuery] = useState("");
+  const [imageSearchHistory, setImageSearchHistory] = useState<ImageSearchHistory[]>(loadImageSearchHistory);
 
-  // 应用启动时加载配置
   useEffect(() => {
     (async () => {
       try {
         const loaded = await invoke<AppSettings>("load_settings");
         setSettings(loaded);
-        // 如果轮换已启用，自动启动轮换
         if (loaded.rotation_enabled) {
           try {
             await invoke("start_rotation");
           } catch {
-            // 启动失败不阻塞应用
           }
         }
       } catch {
-        // 加载失败使用默认值
       }
     })();
   }, []);
@@ -80,13 +104,13 @@ function App() {
     setProgressPercent(null);
     setCurrentPage(1);
     setHasMore(false);
+    setActiveImageQuery("");
 
     try {
-      const atleast = resolution || null;
       const data = await invoke<Wallpaper[]>("search_wallpapers", {
         keyword: kw,
-        atleast,
         page: 1,
+        colors: null,
       });
       setResults(data);
       setHasMore(data.length >= WALLHAVEN_PAGE_SIZE);
@@ -98,25 +122,25 @@ function App() {
     } finally {
       setSearching(false);
     }
-  }, [keyword, resolution]);
+  }, [keyword]);
 
-  // 修复遗留问题: doLoadMore 中 resultText 使用函数式 setResults 回调同步更新
   const doLoadMore = useCallback(async () => {
-    const kw = keyword.trim();
+    const kw = activeImageQuery || keyword.trim();
     if (!kw || loadingMore) return;
 
     const nextPage = currentPage + 1;
     setLoadingMore(true);
 
     try {
-      const atleast = resolution || null;
       const data = await invoke<Wallpaper[]>("search_wallpapers", {
         keyword: kw,
-        atleast,
         page: nextPage,
+        colors: null,
       });
       setResults((prev) => {
-        const merged = [...prev, ...data];
+        const existingIds = new Set(prev.map((wp) => wp.id));
+        const unique = data.filter((wp) => !existingIds.has(wp.id));
+        const merged = [...prev, ...unique];
         setResultText(`共 ${merged.length} 条结果`);
         return merged;
       });
@@ -127,7 +151,7 @@ function App() {
     } finally {
       setLoadingMore(false);
     }
-  }, [keyword, resolution, currentPage, loadingMore]);
+  }, [activeImageQuery, keyword, currentPage, loadingMore]);
 
   const toggleSelect = useCallback((id: string) => {
     setSelected((prev) => {
@@ -156,6 +180,12 @@ function App() {
     const total = selected.size;
     const downloadedPaths: Map<string, string> = new Map();
 
+    // 解析分辨率设置
+    const [targetWidth, targetHeight] = resolution
+      ? resolution.split("x").map((s) => parseInt(s, 10))
+      : [0, 0];
+    const useCrop = targetWidth > 0 && targetHeight > 0;
+
     for (const id of selected) {
       const wp = results.find((r) => r.id === id);
       if (!wp || !wp.path) continue;
@@ -164,11 +194,22 @@ function App() {
       const filename = `${wp.id}.${ext}`;
 
       try {
-        const savedPath = await invoke<string>("download_wallpaper", {
-          url: wp.path,
-          targetDir: dir,
-          filename,
-        });
+        let savedPath: string;
+        if (useCrop) {
+          savedPath = await invoke<string>("download_wallpaper_cropped", {
+            url: wp.path,
+            targetDir: dir,
+            filename,
+            targetWidth,
+            targetHeight,
+          });
+        } else {
+          savedPath = await invoke<string>("download_wallpaper", {
+            url: wp.path,
+            targetDir: dir,
+            filename,
+          });
+        }
         downloadedPaths.set(id, savedPath);
         downloaded++;
       } catch {
@@ -190,30 +231,169 @@ function App() {
 
     if (downloaded) toast.success(summary);
     else if (errors) toast.error(summary);
-  }, [settings.download_dir, selected, results]);
+  }, [settings.download_dir, selected, results, resolution]);
 
-  // 修复遗留问题: 仅当选中单张已下载壁纸时启用"设为壁纸"
-  const doSetWallpaper = useCallback(async () => {
-    const selectedIds = Array.from(selected);
-    const downloadedSelected = selectedIds.filter((id) => downloadedFiles.has(id));
-    if (downloadedSelected.length !== 1) {
-      toast.info("请选中单张已下载的壁纸");
+  const doImageSearch = useCallback(async () => {
+    try {
+      const filePath = await open({
+        title: "选择图片进行以图搜图",
+        filters: [{ name: "图片文件", extensions: ["jpg", "jpeg", "png", "bmp", "webp"] }],
+      });
+      if (!filePath) return;
+
+      setImageSearching(true);
+      setResults([]);
+      setSelected(new Set());
+      setResultText("正在分析图片...");
+      setProgressPercent(null);
+      setCurrentPage(1);
+      setHasMore(false);
+
+      const analysis = await invoke<ImageSearchAnalysis>("analyze_wallpaper_image", {
+        path: filePath as string,
+      });
+
+      const query = analysis.primary_query.trim();
+      if (!query) {
+        throw new Error("未生成可用搜索词");
+      }
+
+      setActiveImageQuery(query);
+      setKeyword(query);
+      setResultText("搜索中...");
+
+      const data = await invoke<Wallpaper[]>("search_wallpapers", {
+        keyword: query,
+        page: 1,
+        colors: null,
+      });
+      // 以图搜图结果去重（按 id）
+      const seen = new Set<string>();
+      const unique = data.filter((wp) => {
+        if (seen.has(wp.id)) return false;
+        seen.add(wp.id);
+        return true;
+      });
+      setResults(unique);
+      setHasMore(unique.length >= WALLHAVEN_PAGE_SIZE);
+      setResultText(unique.length ? `找到 ${unique.length} 条结果` : "未找到结果");
+      if (unique.length) {
+        toast.success(`找到 ${unique.length} 张壁纸`);
+        // 保存到历史记录（使用原图路径）
+        const newHistory: ImageSearchHistory = {
+          keyword: query,
+          imagePath: filePath as string,
+          timestamp: Date.now(),
+        };
+        const updated = [newHistory, ...imageSearchHistory.filter((h) => h.keyword !== query)];
+        setImageSearchHistory(updated);
+        saveImageSearchHistory(updated);
+      }
+    } catch (e) {
+      setResultText("");
+      toast.error(String(e));
+    } finally {
+      setImageSearching(false);
+    }
+  }, [imageSearchHistory]);
+
+  // 从历史记录搜索
+  const doHistorySearch = useCallback(async (kw: string) => {
+    setKeyword(kw);
+    setSearching(true);
+    setResults([]);
+    setSelected(new Set());
+    setResultText("搜索中...");
+    setProgressPercent(null);
+    setCurrentPage(1);
+    setHasMore(false);
+    setActiveImageQuery(kw);
+
+    try {
+      const data = await invoke<Wallpaper[]>("search_wallpapers", {
+        keyword: kw,
+        page: 1,
+        colors: null,
+      });
+      const seen = new Set<string>();
+      const unique = data.filter((wp) => {
+        if (seen.has(wp.id)) return false;
+        seen.add(wp.id);
+        return true;
+      });
+      setResults(unique);
+      setHasMore(unique.length >= WALLHAVEN_PAGE_SIZE);
+      setResultText(unique.length ? `找到 ${unique.length} 条结果` : "未找到结果");
+      if (unique.length) toast.success(`找到 ${unique.length} 张壁纸`);
+    } catch (e) {
+      setResultText("");
+      toast.error(String(e));
+    } finally {
+      setSearching(false);
+    }
+  }, []);
+
+  // 全选/取消全选
+  const doToggleSelectAll = useCallback(() => {
+    if (selected.size === results.length && results.length > 0) {
+      setSelected(new Set());
+    } else {
+      setSelected(new Set(results.map((wp) => wp.id)));
+    }
+  }, [selected, results]);
+
+  // 设为壁纸（搜索页）：选中单张 → 下载到本地壁纸目录 → 设为桌面
+  const doSetWallpaperFromSearch = useCallback(async () => {
+    if (selected.size !== 1) {
+      toast.info("请选中单张壁纸");
       return;
     }
-    const localPath = downloadedFiles.get(downloadedSelected[0])!;
+    const id = Array.from(selected)[0];
+    const wp = results.find((r) => r.id === id);
+    if (!wp || !wp.path) return;
+
+    const dir = settings.local_wallpaper_dir.trim() || settings.download_dir.trim();
+    if (!dir) {
+      toast.info("请先在设置中配置本地壁纸目录");
+      return;
+    }
+
     try {
-      const msg = await invoke<string>("set_wallpaper", { path: localPath });
+      setResultText("下载并设置中...");
+      const ext = wp.path.split(".").pop() || "jpg";
+      const filename = `${wp.id}.${ext}`;
+
+      // 解析分辨率设置
+      const [targetWidth, targetHeight] = resolution
+        ? resolution.split("x").map((s) => parseInt(s, 10))
+        : [0, 0];
+      const useCrop = targetWidth > 0 && targetHeight > 0;
+
+      let savedPath: string;
+      if (useCrop) {
+        savedPath = await invoke<string>("download_wallpaper_cropped", {
+          url: wp.path,
+          targetDir: dir,
+          filename,
+          targetWidth,
+          targetHeight,
+        });
+      } else {
+        savedPath = await invoke<string>("download_wallpaper", {
+          url: wp.path,
+          targetDir: dir,
+          filename,
+        });
+      }
+      setDownloadedFiles((prev) => new Map([...prev, [id, savedPath]]));
+      const msg = await invoke<string>("set_wallpaper", { path: savedPath });
       toast.success(msg);
+      setResultText("壁纸已设置");
     } catch (e) {
       toast.error(String(e));
+      setResultText("");
     }
-  }, [selected, downloadedFiles]);
-
-  // 修复遗留问题: 使用 useMemo 缓存 canSetWallpaper
-  const canSetWallpaper = useMemo(() => {
-    const downloadedSelected = Array.from(selected).filter((id) => downloadedFiles.has(id));
-    return downloadedSelected.length === 1;
-  }, [selected, downloadedFiles]);
+  }, [selected, results, settings, resolution]);
 
   return (
     <div className="flex flex-col h-screen p-5 gap-3 bg-background">
@@ -230,27 +410,35 @@ function App() {
             keyword={keyword}
             resolution={resolution}
             searching={searching}
+            imageSearching={imageSearching}
+            imageSearchHistory={imageSearchHistory}
             onKeywordChange={setKeyword}
             onResolutionChange={setResolution}
             onSearch={doSearch}
+            onImageSearch={doImageSearch}
+            onHistorySearch={doHistorySearch}
           />
           <DirectoryBar
             downloadDir={settings.download_dir}
             onDirectoryChange={(dir) => {
               const updated = { ...settings, download_dir: dir };
               setSettings(updated);
-              invoke("save_settings", { settings: updated }).catch(() => {});
+              invoke("save_settings", { settings: updated })
+                .then(() => toast.success("下载目录已更新"))
+                .catch(() => {});
             }}
           />
           <Separator />
           <ActionBar
             selectedCount={selected.size}
+            totalCount={results.length}
             downloading={downloading}
             progressPercent={progressPercent}
             resultText={resultText}
             onDownload={doDownload}
-            onSetWallpaper={doSetWallpaper}
-            canSetWallpaper={canSetWallpaper}
+            onSetWallpaper={doSetWallpaperFromSearch}
+            canSetWallpaper={selected.size === 1}
+            onToggleSelectAll={doToggleSelectAll}
           />
           <WallpaperGrid
             wallpapers={results}
@@ -273,10 +461,7 @@ function App() {
         </TabsContent>
       </Tabs>
 
-      <ImagePreview
-        wallpaper={previewWallpaper}
-        onClose={() => setPreviewWallpaper(null)}
-      />
+      <ImagePreview wallpaper={previewWallpaper} onClose={() => setPreviewWallpaper(null)} />
     </div>
   );
 }

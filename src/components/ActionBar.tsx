@@ -1,28 +1,43 @@
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
-import { Download, Loader2, Monitor } from "lucide-react";
+import { Download, Loader2, Monitor, CheckSquare } from "lucide-react";
 
 interface ActionBarProps {
   selectedCount: number;
+  totalCount: number;
   downloading: boolean;
   progressPercent: number | null;
   resultText: string;
   onDownload: () => void;
   onSetWallpaper?: () => void;
   canSetWallpaper?: boolean;
+  onToggleSelectAll?: () => void;
 }
 
 export function ActionBar({
   selectedCount,
+  totalCount,
   downloading,
   progressPercent,
   resultText,
   onDownload,
   onSetWallpaper,
   canSetWallpaper,
+  onToggleSelectAll,
 }: ActionBarProps) {
+  const allSelected = totalCount > 0 && selectedCount === totalCount;
   return (
     <div className="flex gap-3 items-center">
+      {onToggleSelectAll && totalCount > 0 && (
+        <Button
+          variant="outline"
+          onClick={onToggleSelectAll}
+          className="gap-1.5"
+        >
+          <CheckSquare className="size-4" />
+          {allSelected ? "取消全选" : "全选"}
+        </Button>
+      )}
       <Button
         onClick={onDownload}
         disabled={downloading || selectedCount === 0}

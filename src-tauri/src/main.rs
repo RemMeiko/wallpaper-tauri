@@ -206,17 +206,158 @@ fn do_set_wallpaper(path: &str) -> Result<String, String> {
 
 // ── Tauri commands ──
 
+#[derive(Debug, Serialize, Deserialize)]
+struct ImageSearchAnalysis {
+    primary_query: String,
+    queries: Vec<String>,
+    artist: Option<String>,
+    series: Option<String>,
+    category_hint: Option<String>,
+    confidence: String,
+}
+
 #[tauri::command]
-async fn search_wallpapers(keyword: String, atleast: Option<String>, page: Option<u32>) -> Result<Vec<Wallpaper>, String> {
+async fn analyze_wallpaper_image(path: String) -> Result<ImageSearchAnalysis, String> {
+    let image_bytes = std::fs::read(&path).map_err(|e| format!("读取图片失败：{}", e))?;
+
+    if std::env::var("ANTHROPIC_API_KEY").ok().filter(|v| !v.trim().is_empty()).is_none() {
+        return Err("未配置 ANTHROPIC_API_KEY，请先设置环境变量后再试。".to_string());
+    }
+
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&image_bytes);
+
+    let media_type = match path.rsplit('.').next().map(|e| e.to_lowercase()).as_deref() {
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("png") => "image/png",
+        Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
+        _ => "image/png",
+    };
+    let prompt = r#"你是一个 wallhaven 壁纸搜索分析器。目标：根据输入图片识别最可能的画师/作者、作品系列/IP；如果都无法可靠识别，再退化到风格标签。
+
+请严格返回 JSON：
+{
+  "artist": "字符串或空",
+  "series": "字符串或空",
+  "confidence": "high|medium|low",
+  "category_hint": "anime|general|people",
+  "queries": ["从宽到窄的1到4条搜索词"]
+}
+
+搜索词生成优先级：
+1. 画师名
+2. 画师名 + 内容类型
+3. 画师名 + 场景元素
+4. 如果无法识别画师，再用系列/IP；再不行才用风格标签
+
+要求：
+- 不要解释
+- queries[0] 必须是最推荐直接执行的搜索词
+- 如果无法判断 artist/series，用空字符串
+"#;
+
+    let body = serde_json::json!({
+        "model": "claude-opus-4-6",
+        "max_tokens": 400,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": encoded
+                    }
+                }
+            ]
+        }]
+    });
+
+    let api_key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| "未配置 ANTHROPIC_API_KEY".to_string())?;
+    let base_url = std::env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| "https://api.anthropic.com".to_string());
+    let api_url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&api_url)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("调用 Claude 视觉分析失败：{}", e))?;
+
+    if !response.status().is_success() {
+        let text = response.text().await.unwrap_or_default();
+        return Err(format!("Claude 分析失败：{}", text));
+    }
+
+    let value: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("解析 Claude 响应失败：{}", e))?;
+
+    let text = value["content"]
+        .as_array()
+        .and_then(|arr| arr.first())
+        .and_then(|item| item["text"].as_str())
+        .ok_or_else(|| "Claude 未返回可解析文本".to_string())?;
+
+    // 剥离 markdown 代码块包裹（如 ```json ... ```）
+    let json_text = text.trim();
+    let json_text = if json_text.starts_with("```") {
+        let inner = json_text
+            .strip_prefix("```json").or_else(|| json_text.strip_prefix("```"))
+            .unwrap_or(json_text);
+        inner.strip_suffix("```").unwrap_or(inner).trim()
+    } else {
+        json_text
+    };
+
+    let parsed: serde_json::Value = serde_json::from_str(json_text)
+        .map_err(|e| format!("Claude 返回的 JSON 无法解析：{}，原文：{}", e, &json_text[..json_text.len().min(200)]))?;
+
+    let queries = parsed["queries"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if queries.is_empty() {
+        return Err("Claude 未生成可用搜索词".to_string());
+    }
+
+    Ok(ImageSearchAnalysis {
+        primary_query: queries[0].clone(),
+        queries,
+        artist: parsed["artist"].as_str().filter(|s| !s.is_empty()).map(|s| s.to_string()),
+        series: parsed["series"].as_str().filter(|s| !s.is_empty()).map(|s| s.to_string()),
+        category_hint: parsed["category_hint"].as_str().filter(|s| !s.is_empty()).map(|s| s.to_string()),
+        confidence: parsed["confidence"].as_str().unwrap_or("low").to_string(),
+    })
+}
+
+#[tauri::command]
+async fn search_wallpapers(keyword: String, page: Option<u32>, colors: Option<String>) -> Result<Vec<Wallpaper>, String> {
     let page_num = page.unwrap_or(1);
     let mut url = format!(
-        "https://wallhaven.cc/api/v1/search?q={}&purity=100&sorting=date_added&page={}",
+        "https://wallhaven.cc/api/v1/search?q={}&purity=100&sorting=date_added&order=desc&page={}",
         urlencoding::encode(&keyword),
         page_num
     );
 
-    if let Some(res) = atleast {
-        url.push_str(&format!("&atleast={}", res));
+    if let Some(ref color) = colors {
+        if !color.is_empty() {
+            url.push_str(&format!("&colors={}", color));
+        }
     }
 
     let client = reqwest::Client::new();
@@ -270,6 +411,79 @@ async fn download_wallpaper(url: String, target_dir: String, filename: String) -
 
     std::fs::write(&target_path, bytes)
         .map_err(|e| format!("保存文件失败：{}", e))?;
+
+    Ok(target_path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+async fn download_wallpaper_cropped(
+    url: String,
+    target_dir: String,
+    filename: String,
+    target_width: u32,
+    target_height: u32,
+) -> Result<String, String> {
+    let client = reqwest::Client::new();
+    let response = client
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0")
+        .send()
+        .await
+        .map_err(|e| format!("下载失败：{}", e))?;
+
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| format!("读取失败：{}", e))?;
+
+    // 解码图片
+    let img = image::load_from_memory(&bytes)
+        .map_err(|e| format!("图片解码失败：{}", e))?;
+
+    let (src_w, src_h) = (img.width(), img.height());
+    let target_ratio = target_width as f64 / target_height as f64;
+    let src_ratio = src_w as f64 / src_h as f64;
+
+    // 居中裁剪到目标宽高比
+    let (crop_w, crop_h) = if src_ratio > target_ratio {
+        // 原图更宽，裁左右
+        let h = src_h;
+        let w = (h as f64 * target_ratio).round() as u32;
+        (w.min(src_w), h)
+    } else {
+        // 原图更高，裁上下
+        let w = src_w;
+        let h = (w as f64 / target_ratio).round() as u32;
+        (w, h.min(src_h))
+    };
+
+    let crop_x = (src_w.saturating_sub(crop_w)) / 2;
+    let crop_y = (src_h.saturating_sub(crop_h)) / 2;
+
+    let cropped = img.crop_imm(crop_x, crop_y, crop_w, crop_h);
+
+    // 缩放到目标分辨率
+    let resized = cropped.resize_exact(
+        target_width,
+        target_height,
+        image::imageops::FilterType::Lanczos3,
+    );
+
+    // 保存为 PNG
+    let out_filename = format!(
+        "{}_{}x{}.png",
+        filename.rsplit_once('.').map(|(n, _)| n).unwrap_or(&filename),
+        target_width,
+        target_height
+    );
+    let target_path = PathBuf::from(&target_dir).join(&out_filename);
+
+    std::fs::create_dir_all(&target_dir)
+        .map_err(|e| format!("创建目录失败：{}", e))?;
+
+    resized
+        .save(&target_path)
+        .map_err(|e| format!("保存裁剪图片失败：{}", e))?;
 
     Ok(target_path.to_string_lossy().to_string())
 }
@@ -418,13 +632,15 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             search_wallpapers,
             download_wallpaper,
+            download_wallpaper_cropped,
             scan_local_wallpapers,
             set_wallpaper,
             load_settings,
             save_settings,
             start_rotation,
             stop_rotation,
-            get_rotation_status
+            get_rotation_status,
+            analyze_wallpaper_image,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
